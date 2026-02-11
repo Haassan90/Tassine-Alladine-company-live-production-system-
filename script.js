@@ -1,9 +1,11 @@
-
 /************************************************* 
- * 🔒 FINAL FULL SCRIPT.JS (MERGED + ERPNext READY + LOGIN PERSISTENCE)
- * Step 1 → Step 45 Fully Functional + Enhancements
- * Bug fix: Machine action no longer reloads dashboard
- * Improvement: Login persists until logout
+ * 🔒 FINAL FULL SCRIPT.JS (ERPNext READY + REALTIME)
+ * ✅ Single WebSocket
+ * ✅ Machine actions update instantly
+ * ✅ ETA & Next-job countdowns
+ * ✅ Alerts, Metrics, CSV export
+ * ✅ Login persistence
+ * ✅ Filters & search
  *************************************************/
 
 const API_BASE = "http://127.0.0.1:3333/api";
@@ -83,36 +85,40 @@ restoreLogin();
  ************************/
 function initWebSocket() {
     if (socket && socket.readyState === WebSocket.OPEN) return;
+
     socket = new WebSocket(WS_URL);
 
     socket.onopen = () => { 
         socket.send("ready"); 
-        console.log("✅ WS Connected"); 
-        createAlert("WebSocket connected",0); 
+        console.log("✅ WebSocket Connected"); 
+        createAlert("WebSocket connected", 0); 
     };
 
     socket.onmessage = e => {
         try {
             const data = JSON.parse(e.data);
-            if (suppressNextWSRender) { suppressNextWSRender = false; return; }
             dashboardCache = data;
+
+            if(suppressNextWSRender) { suppressNextWSRender = false; return; }
 
             if(data.new_job) handleNewJob(data.new_job);
 
-            updateDashboardFromWS(data);
+            if(data.locations) renderDashboard({ locations: data.locations });
+            if(data.locations) updateMetricsModal({ locations: data.locations });
+            if(data.work_orders) renderWorkOrders(data.work_orders);
+
             handleAlerts(data);
             loadProductionLogs();
-            updateMetricsModal(data);
-        } catch (err) { 
-            console.error("WS parse error", err); 
-            createAlert("WebSocket data error",2); 
+        } catch(err) {
+            console.error("WS parse error", err);
+            createAlert("WebSocket data error", 2);
         }
     };
 
-    socket.onclose = () => { 
-        socket = null; 
-        createAlert("WebSocket disconnected. Reconnecting...",2); 
-        setTimeout(initWebSocket,3000); 
+    socket.onclose = () => {
+        socket = null;
+        createAlert("WebSocket disconnected. Reconnecting...", 2);
+        setTimeout(initWebSocket, 3000);
     };
 
     socket.onerror = () => socket.close();
@@ -166,7 +172,7 @@ async function loadProductionLogs() {
  * RENDER DASHBOARD
  ************************/
 function renderDashboard(data){
-    if(!currentUser) return; // Prevent showing dashboard if not logged in
+    if(!currentUser) return;
     const container = document.getElementById("locations");
     container.innerHTML = "";
     if(!data?.locations) return;
@@ -180,35 +186,33 @@ function renderDashboard(data){
 
     visibleLocations.forEach(loc=>{
         let machines = loc.machines;
-        if(statusFilter!=="all") machines=machines.filter(m=>m.status===statusFilter);
-        if(searchFilter) machines=machines.filter(m=>m.name.toLowerCase().includes(searchFilter)||(m.job?.work_order||"").toLowerCase().includes(searchFilter));
+        if(statusFilter!=="all") machines = machines.filter(m=>m.status===statusFilter);
+        if(searchFilter) machines = machines.filter(m=>m.name.toLowerCase().includes(searchFilter) || (m.job?.work_order||"").toLowerCase().includes(searchFilter));
         renderLocation(loc.name, machines);
     });
 }
 
-function renderLocation(location,machines){
-    const wrap=document.createElement("div");
-    wrap.className="location";
-    wrap.innerHTML=`<h2>${location}</h2><div class="machines-grid"></div>`;
+function renderLocation(location, machines){
+    const wrap = document.createElement("div");
+    wrap.className = "location";
+    wrap.innerHTML = `<h2>${location}</h2><div class="machines-grid"></div>`;
     document.getElementById("locations").appendChild(wrap);
-    const grid=wrap.querySelector(".machines-grid");
+    const grid = wrap.querySelector(".machines-grid");
 
-    machines.forEach(m=>{
-        createOrUpdateMachineCard(m, location, grid);
-    });
+    machines.forEach(m => createOrUpdateMachineCard(m, location, grid));
 }
 
 /************************
- * MACHINE CARD CREATION / UPDATE
+ * MACHINE CARD CREATE / UPDATE
  ************************/
 function createOrUpdateMachineCard(machine, location, parentGrid){
     let card = document.getElementById(`machine-${machine.id}`);
-    const remainingTimeText = machine.job?.remaining_time!=null ? formatTime(machine.job.remaining_time) : "N/A";
+    const remainingTimeText = machine.job?.remaining_time != null ? formatTime(machine.job.remaining_time) : "N/A";
     const progressPercent = machine.job?.progress_percent != null ? Math.min(machine.job.progress_percent.toFixed(1),100) : 0;
 
     const cardHTML = `<h3>${machine.name}${currentUser.role==="admin"?`<button type="button" class="btn edit" data-location="${location}" data-id="${machine.id}" data-name="${machine.name}">✏</button>`:""}</h3>
         <p>Status: <b>${machine.status.toUpperCase()}</b></p>
-        ${machine.job?`
+        ${machine.job ? `
             <div class="job-card">
                 <p>WO: ${machine.job.work_order}</p>
                 <p>Size: ${machine.job.size}</p>
@@ -218,22 +222,21 @@ function createOrUpdateMachineCard(machine, location, parentGrid){
                 <div class="progress-bar-container">
                     <div class="progress-bar" style="width:${progressPercent}%;background-color:${progressPercent>=90?'red':progressPercent>=75?'orange':'green'}"></div>
                 </div>
-            </div>`:`<div class="job-card"><p>No Job</p></div>`}
-        ${currentUser.role==="operator"?`
+            </div>` : `<div class="job-card"><p>No Job</p></div>`}
+        ${currentUser.role==="operator" ? `
             <div class="controls">
                 <button type="button" class="btn start" data-location="${location}" data-id="${machine.id}">▶</button>
                 <button type="button" class="btn pause" data-location="${location}" data-id="${machine.id}">⏸</button>
                 <button type="button" class="btn stop" data-location="${location}" data-id="${machine.id}">⛔</button>
             </div>`:""}
-        
-        ${machine.next_job?`
+        ${machine.next_job ? `
             <div class="next-job-card">
                 <h4>Next Job Queue</h4>
                 <p>WO: ${machine.next_job.work_order}</p>
                 <p>Size: ${machine.next_job.pipe_size}</p>
                 <p>Produced: ${machine.next_job.produced_qty}/${machine.next_job.total_qty}</p>
                 <p>ETA: <span id="next-eta-${machine.id}">${formatTime(machine.next_job.remaining_time)}</span></p>
-            </div>`:""}`;
+            </div>` : ""}`;
 
     if(card){
         card.innerHTML = cardHTML;
@@ -245,45 +248,57 @@ function createOrUpdateMachineCard(machine, location, parentGrid){
         parentGrid.appendChild(card);
     }
 
-    if(machine.job?.remaining_time!=null) setupETACountdown(machine.id, machine.job.remaining_time);
-    if(machine.next_job?.remaining_time!=null) setupNextJobCountdown(machine.id, machine.next_job.remaining_time);
+    if(machine.job?.remaining_time != null) setupETACountdown(machine.id, machine.job.remaining_time);
+    if(machine.next_job?.remaining_time != null) setupNextJobCountdown(machine.id, machine.next_job.remaining_time);
 }
 
 /************************
- * MACHINE ACTIONS (NO RELOAD)
+ * MACHINE ACTIONS (INSTANT UPDATE, NO PAGE REFRESH)
  ************************/
-async function machineAction(e,action,location,id){
+async function machineAction(e, action, location, id){
     e.preventDefault();
     e.stopPropagation();
-    suppressNextWSRender=true; 
-    try{
-        const res=await fetch(`${API_BASE}/machine/${action}`,{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({location,machine_id:id})
+
+    try {
+        const res = await fetch(`${API_BASE}/machine/${action}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ location, machine_id: id })
         });
-        const data=await res.json();
-        if(!data.ok) alert(`❌ ${action} failed`);
-        else if(data.machine){
-            const grid = Array.from(document.querySelectorAll(".location"))
-                .find(el=>el.querySelector("h2").textContent===location)
-                ?.querySelector(".machines-grid");
-            if(grid) createOrUpdateMachineCard(data.machine, location, grid);
+
+        const data = await res.json();
+
+        if (!data.ok) {
+            alert(`❌ ${action} failed`);
+            return;
         }
-    }catch(err){console.error(err); alert(`❌ ${action} failed`);}
+
+        // 🔄 Update instantly
+        const card = document.getElementById(`machine-${id}`);
+        if(card && data.machine){
+            const grid = card.parentElement;
+            createOrUpdateMachineCard(data.machine, location, grid);
+        }
+
+    } catch (err) {
+        console.error(err);
+        alert(`❌ ${action} failed`);
+    }
 }
+
 
 /************************
  * NEW JOB ALERT
  ************************/
 function handleNewJob(job){
-    const {machine_id,work_order,qty,pipe_size,eta}=job;
-    const machineEl=document.getElementById(`machine-${machine_id}`);
+    const { machine_id, work_order, qty, pipe_size, eta } = job;
+    const machineEl = document.getElementById(`machine-${machine_id}`);
     if(!machineEl) return;
-    createAlert(`New job assigned to ${machineEl.querySelector("h3").innerText}: ${work_order}`,1);
-    const jobCard=machineEl.querySelector(".job-card");
+    createAlert(`New job assigned to ${machineEl.querySelector("h3").innerText}: ${work_order}`, 1);
+
+    const jobCard = machineEl.querySelector(".job-card");
     if(jobCard){
-        jobCard.innerHTML=`<p>WO: ${work_order}</p>
+        jobCard.innerHTML = `<p>WO: ${work_order}</p>
             <p>Size: ${pipe_size}</p>
             <p>Produced: 0/${qty}</p>
             <p>Remaining: <span id="eta-${machine_id}">${formatTime(eta)}</span></p>
@@ -292,7 +307,7 @@ function handleNewJob(job){
                 <div class="progress-bar" style="width:0%;background-color:green"></div>
             </div>`;
     }
-    setupETACountdown(machine_id,eta);
+    setupETACountdown(machine_id, eta);
 }
 
 /************************
@@ -301,33 +316,76 @@ function handleNewJob(job){
 function formatTime(sec){if(!sec||sec<0)return "0:00"; const m=Math.floor(sec/60); const s=Math.floor(sec%60); return `${m}:${s.toString().padStart(2,'0')}`;}
 function setupETACountdown(id,sec){clearInterval(etaIntervals[id]);let t=sec; etaIntervals[id]=setInterval(()=>{const el=document.getElementById(`eta-${id}`);if(!el) return; el.textContent=formatTime(t--); if(t<0) clearInterval(etaIntervals[id]);},1000);}
 function setupNextJobCountdown(id,sec){clearInterval(nextJobIntervals[id]);let t=sec; nextJobIntervals[id]=setInterval(()=>{const el=document.getElementById(`next-eta-${id}`);if(!el) return; el.textContent=formatTime(t--); if(t<0) clearInterval(nextJobIntervals[id]);},1000);}
+/************************
+ * ETA / NEXT JOB COUNTDOWN (WEB SOCKET SYNC SAFE)
+ ************************/
+function formatTime(sec){ 
+    if(!sec||sec<0) return "0:00"; 
+    const m = Math.floor(sec/60); 
+    const s = Math.floor(sec%60); 
+    return `${m}:${s.toString().padStart(2,'0')}`;
+}
+
+function setupETACountdown(id, sec){
+    clearInterval(etaIntervals[id]); // 🔹 Clear any previous timer
+    let t = sec;
+    const el = document.getElementById(`eta-${id}`);
+    if(!el) return;
+
+    el.textContent = formatTime(t); // 🔹 Initialize immediately
+    etaIntervals[id] = setInterval(() => {
+        if(!el) { clearInterval(etaIntervals[id]); return; }
+        el.textContent = formatTime(t--);
+        if(t < 0) clearInterval(etaIntervals[id]);
+    }, 1000);
+}
+
+function setupNextJobCountdown(id, sec){
+    clearInterval(nextJobIntervals[id]); // 🔹 Clear previous timer
+    let t = sec;
+    const el = document.getElementById(`next-eta-${id}`);
+    if(!el) return;
+
+    el.textContent = formatTime(t); // 🔹 Initialize immediately
+    nextJobIntervals[id] = setInterval(() => {
+        if(!el) { clearInterval(nextJobIntervals[id]); return; }
+        el.textContent = formatTime(t--);
+        if(t < 0) clearInterval(nextJobIntervals[id]);
+    }, 1000);
+}
 
 /************************
  * ALERTS PANEL
  ************************/
 function handleAlerts(data){
-    const alertsContainer=document.getElementById("alerts"); if(!alertsContainer) return; alertsContainer.innerHTML="";
+    const alertsContainer = document.getElementById("alerts"); if(!alertsContainer) return; alertsContainer.innerHTML="";
     data.locations.forEach(loc=>{loc.machines.forEach(m=>{
-        if(m.job){const p=m.job.progress_percent;if(p>=75&&p<90) createAlert(`${m.name} reached 75% progress!`,1); else if(p>=90&&p<100) createAlert(`${m.name} reached 90% progress!`,2); else if(p>=100) createAlert(`${m.name} completed!`,3);}})});
+        if(m.job){
+            const p = m.job.progress_percent;
+            if(p>=75 && p<90) createAlert(`${m.name} reached 75% progress!`,1);
+            else if(p>=90 && p<100) createAlert(`${m.name} reached 90% progress!`,2);
+            else if(p>=100) createAlert(`${m.name} completed!`,3);
+        }
+    })});
 }
 function createAlert(message,level){
-    const alertsContainer=document.getElementById("alerts"); 
+    const alertsContainer = document.getElementById("alerts"); 
     if(!alertsContainer) return;
-    const alertDiv=document.createElement("div");
-    alertDiv.className="alert"; 
-    alertDiv.style.backgroundColor=level===3?"#2196f3":level===2?"#f44336":"#ff9800"; 
-    alertDiv.textContent=message; 
+    const alertDiv = document.createElement("div");
+    alertDiv.className = "alert"; 
+    alertDiv.style.backgroundColor = level===3?"#2196f3":level===2?"#f44336":"#ff9800"; 
+    alertDiv.textContent = message; 
     alertsContainer.prepend(alertDiv); 
     setTimeout(()=>alertDiv.remove(),10000);
 }
 
 /************************
- * METRICS MODAL (AUTO-REFRESH)
+ * METRICS MODAL
  ************************/
 function updateMetricsModal(data){
-    const modal=document.getElementById("metrics-modal");
+    const modal = document.getElementById("metrics-modal");
     if(!modal) return;
-    const tbody=modal.querySelector("tbody"); tbody.innerHTML="";
+    const tbody = modal.querySelector("tbody"); tbody.innerHTML="";
     data.locations.forEach(loc=>{loc.machines.forEach(m=>{
         const tr=document.createElement("tr");
         tr.innerHTML=`<td>${loc.name}</td><td>${m.name}</td><td>${m.status}</td><td>${m.job?m.job.work_order:"N/A"}</td><td>${m.job?`${m.job.completed_qty}/${m.job.total_qty}`:"-"}</td><td>${m.job?m.job.progress_percent:0}</td>`;
@@ -357,14 +415,12 @@ function initFilters(){
  * EVENT DELEGATION
  ************************/
 document.addEventListener("click",function(e){
-    const btn=e.target.closest("button"); if(!btn) return;
+    const btn = e.target.closest("button"); if(!btn) return;
 
     if(btn.classList.contains("start")) machineAction(e,'start',btn.dataset.location,btn.dataset.id);
     else if(btn.classList.contains("pause")) machineAction(e,'pause',btn.dataset.location,btn.dataset.id);
     else if(btn.classList.contains("stop")) machineAction(e,'stop',btn.dataset.location,btn.dataset.id);
     else if(btn.classList.contains("edit")) editMachineName(e,btn.dataset.location,btn.dataset.id,btn.dataset.name);
-    else if(btn.classList.contains("create-wo")) createWorkOrder(e,btn.dataset.location,btn.dataset.id);
-    else if(btn.classList.contains("sync-wo")) syncWorkOrder(e,btn.dataset.location,btn.dataset.id);
     else if(btn.id==="btn-view-metrics") openMetricsModal();
     else if(btn.id==="btn-close-metrics") closeMetricsModal();
     else if(btn.id==="btn-export-csv") exportTableToCSV('metrics-table','metrics.csv');
@@ -372,116 +428,37 @@ document.addEventListener("click",function(e){
 
 // Close WS on page unload
 window.addEventListener("beforeunload",()=>{if(socket) socket.close();});
-async function editMachineName(e, location, machineId, oldName) {
-    e.preventDefault();
-    e.stopPropagation();
 
+/************************
+ * MACHINE RENAME
+ ************************/
+async function editMachineName(e, location, machineId, oldName){
+    e.preventDefault(); e.stopPropagation();
     const newName = prompt("Enter new machine name:", oldName);
-    if (!newName || newName.trim() === oldName) return;
+    if(!newName || newName.trim()===oldName) return;
 
-    try {
-        const res = await fetch(`${API_BASE}/machine/rename`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                location: location,
-                machine_id: machineId,
-                new_name: newName.trim()
-            })
+    try{
+        const res = await fetch(`${API_BASE}/machine/rename`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({location,machine_id:machineId,new_name:newName.trim()})
         });
-
         const data = await res.json();
-        if (!data.ok) {
-            alert("❌ Rename failed");
-            return;
-        }
+        if(!data.ok) { alert("❌ Rename failed"); return; }
 
-        // 🔄 Update UI instantly (no reload)
         const card = document.getElementById(`machine-${machineId}`);
-        if (card) {
-            const h3 = card.querySelector("h3");
-            h3.childNodes[0].nodeValue = newName + " ";
-        }
-
-        createAlert(`✅ Machine renamed to ${newName}`, 0);
-
-    } catch (err) {
-        console.error(err);
-        alert("❌ Rename error");
-    }
+        if(card){ const h3 = card.querySelector("h3"); h3.childNodes[0].nodeValue = newName + " "; }
+        createAlert(`✅ Machine renamed to ${newName}`,0);
+    } catch(err){ console.error(err); alert("❌ Rename error"); }
 }
 
-function renderMachines(locations){
-    // Example: render machines on dashboard
-    locations.forEach(loc => {
-        console.log("Location:", loc.name);
-        loc.machines.forEach(m => {
-            console.log(` - ${m.name}: ${m.status}, WO: ${m.job ? m.job.work_order : "None"}`);
-        });
-    });
-}
-
+/************************
+ * ERPNext WORK ORDERS
+ ************************/
 function renderWorkOrders(work_orders){
     console.log("ERPNext Work Orders:");
     work_orders.forEach(wo => {
         console.log(` - ${wo.id}: ${wo.status}, Qty: ${wo.produced_qty}/${wo.qty}`);
     });
 }
-/************************
- * SINGLE WEBSOCKET (REALTIME)
- ************************/
-function initWebSocket() {
-    if (socket && socket.readyState === WebSocket.OPEN) return;
 
-    socket = new WebSocket("ws://127.0.0.1:3333/ws/dashboard");
-
-    socket.onopen = () => {
-        console.log("✅ WebSocket connected!");
-        createAlert("WebSocket connected", 0);
-        socket.send("ready"); // optional handshake
-    };
-
-    socket.onmessage = (event) => {
-        try {
-            const data = JSON.parse(event.data);
-
-            // Cache data for further use
-            dashboardCache = data;
-
-            // 1️⃣ Update machine dashboard
-            if (data.locations) {
-                renderDashboard({ locations: data.locations }); // reuse existing dashboard renderer
-            }
-
-            // 2️⃣ Update ERPNext work orders
-            if (data.work_orders) {
-                renderWorkOrders(data.work_orders);
-            }
-
-            // 3️⃣ Handle new job alerts (if any)
-            if (data.new_job) {
-                handleNewJob(data.new_job);
-            }
-
-            // 4️⃣ Handle production alerts
-            handleAlerts(data);
-
-            // 5️⃣ Update metrics modal
-            updateMetricsModal({ locations: data.locations });
-        } catch (err) {
-            console.error("WebSocket parse error", err);
-            createAlert("WebSocket data error", 2);
-        }
-    };
-
-    socket.onclose = () => {
-        socket = null;
-        createAlert("WebSocket disconnected. Reconnecting...", 2);
-        setTimeout(initWebSocket, 3000); // auto-reconnect
-    };
-
-    socket.onerror = () => socket.close();
-}
-
-// Initialize WebSocket on login or page load
-restoreLogin();
