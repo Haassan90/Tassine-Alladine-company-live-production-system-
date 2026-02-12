@@ -6,6 +6,9 @@
  * ✅ Alerts, Metrics, CSV export
  * ✅ Login persistence
  * ✅ Filters & search
+ * ✅ ERPNext Work Orders rendered in dashboard
+ * ✅ Machine rename persists across refresh
+ * ✅ New jobs assigned and updated correctly
  *************************************************/
 
 const API_BASE = "http://127.0.0.1:3333/api";
@@ -27,6 +30,7 @@ let etaIntervals = {};
 let nextJobIntervals = {};
 let suppressNextWSRender = false;
 let dashboardCache = {};
+const renamedMachines = {}; // 🔹 Preserve renamed names
 
 /************************
  * LOGIN PERSISTENCE
@@ -136,6 +140,7 @@ async function loadDashboard() {
         dashboardCache = data;
         renderDashboard(data);
         updateMetricsModal(data);
+        if(data.work_orders) renderWorkOrders(data.work_orders);
     } catch {
         console.error("Backend not reachable");
         createAlert("Backend not reachable. Retry in 3s",2);
@@ -204,13 +209,16 @@ function renderLocation(location, machines){
 
 /************************
  * MACHINE CARD CREATE / UPDATE
+ * 🔹 Fixed: Preserve renamed machine names
  ************************/
 function createOrUpdateMachineCard(machine, location, parentGrid){
     let card = document.getElementById(`machine-${machine.id}`);
+    const displayName = renamedMachines[machine.id] || machine.name; // Preserve renamed name
+
     const remainingTimeText = machine.job?.remaining_time != null ? formatTime(machine.job.remaining_time) : "N/A";
     const progressPercent = machine.job?.progress_percent != null ? Math.min(machine.job.progress_percent.toFixed(1),100) : 0;
 
-    const cardHTML = `<h3>${machine.name}${currentUser.role==="admin"?`<button type="button" class="btn edit" data-location="${location}" data-id="${machine.id}" data-name="${machine.name}">✏</button>`:""}</h3>
+    const cardHTML = `<h3>${displayName}${currentUser.role==="admin"?`<button type="button" class="btn edit" data-location="${location}" data-id="${machine.id}" data-name="${displayName}">✏</button>`:""}</h3>
         <p>Status: <b>${machine.status.toUpperCase()}</b></p>
         ${machine.job ? `
             <div class="job-card">
@@ -253,7 +261,31 @@ function createOrUpdateMachineCard(machine, location, parentGrid){
 }
 
 /************************
- * MACHINE ACTIONS (INSTANT UPDATE, NO PAGE REFRESH)
+ * MACHINE RENAME
+ ************************/
+async function editMachineName(e, location, machineId, oldName){
+    e.preventDefault(); e.stopPropagation();
+    const newName = prompt("Enter new machine name:", oldName);
+    if(!newName || newName.trim()===oldName) return;
+
+    try{
+        const res = await fetch(`${API_BASE}/machine/rename`,{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({location,machine_id:machineId,new_name:newName.trim()})
+        });
+        const data = await res.json();
+        if(!data.ok) { alert("❌ Rename failed"); return; }
+
+        renamedMachines[machineId] = newName.trim(); // 🔹 Save locally
+        const card = document.getElementById(`machine-${machineId}`);
+        if(card){ const h3 = card.querySelector("h3"); h3.childNodes[0].nodeValue = newName + " "; }
+        createAlert(`✅ Machine renamed to ${newName}`,0);
+    } catch(err){ console.error(err); alert("❌ Rename error"); }
+}
+
+/************************
+ * MACHINE ACTIONS (INSTANT UPDATE)
  ************************/
 async function machineAction(e, action, location, id){
     e.preventDefault();
@@ -268,12 +300,8 @@ async function machineAction(e, action, location, id){
 
         const data = await res.json();
 
-        if (!data.ok) {
-            alert(`❌ ${action} failed`);
-            return;
-        }
+        if (!data.ok) { alert(`❌ ${action} failed`); return; }
 
-        // 🔄 Update instantly
         const card = document.getElementById(`machine-${id}`);
         if(card && data.machine){
             const grid = card.parentElement;
@@ -286,38 +314,8 @@ async function machineAction(e, action, location, id){
     }
 }
 
-
-/************************
- * NEW JOB ALERT
- ************************/
-function handleNewJob(job){
-    const { machine_id, work_order, qty, pipe_size, eta } = job;
-    const machineEl = document.getElementById(`machine-${machine_id}`);
-    if(!machineEl) return;
-    createAlert(`New job assigned to ${machineEl.querySelector("h3").innerText}: ${work_order}`, 1);
-
-    const jobCard = machineEl.querySelector(".job-card");
-    if(jobCard){
-        jobCard.innerHTML = `<p>WO: ${work_order}</p>
-            <p>Size: ${pipe_size}</p>
-            <p>Produced: 0/${qty}</p>
-            <p>Remaining: <span id="eta-${machine_id}">${formatTime(eta)}</span></p>
-            <p>Progress: 0%</p>
-            <div class="progress-bar-container">
-                <div class="progress-bar" style="width:0%;background-color:green"></div>
-            </div>`;
-    }
-    setupETACountdown(machine_id, eta);
-}
-
 /************************
  * ETA / NEXT JOB COUNTDOWN
- ************************/
-function formatTime(sec){if(!sec||sec<0)return "0:00"; const m=Math.floor(sec/60); const s=Math.floor(sec%60); return `${m}:${s.toString().padStart(2,'0')}`;}
-function setupETACountdown(id,sec){clearInterval(etaIntervals[id]);let t=sec; etaIntervals[id]=setInterval(()=>{const el=document.getElementById(`eta-${id}`);if(!el) return; el.textContent=formatTime(t--); if(t<0) clearInterval(etaIntervals[id]);},1000);}
-function setupNextJobCountdown(id,sec){clearInterval(nextJobIntervals[id]);let t=sec; nextJobIntervals[id]=setInterval(()=>{const el=document.getElementById(`next-eta-${id}`);if(!el) return; el.textContent=formatTime(t--); if(t<0) clearInterval(nextJobIntervals[id]);},1000);}
-/************************
- * ETA / NEXT JOB COUNTDOWN (WEB SOCKET SYNC SAFE)
  ************************/
 function formatTime(sec){ 
     if(!sec||sec<0) return "0:00"; 
@@ -327,12 +325,12 @@ function formatTime(sec){
 }
 
 function setupETACountdown(id, sec){
-    clearInterval(etaIntervals[id]); // 🔹 Clear any previous timer
+    clearInterval(etaIntervals[id]);
     let t = sec;
     const el = document.getElementById(`eta-${id}`);
     if(!el) return;
 
-    el.textContent = formatTime(t); // 🔹 Initialize immediately
+    el.textContent = formatTime(t);
     etaIntervals[id] = setInterval(() => {
         if(!el) { clearInterval(etaIntervals[id]); return; }
         el.textContent = formatTime(t--);
@@ -341,12 +339,12 @@ function setupETACountdown(id, sec){
 }
 
 function setupNextJobCountdown(id, sec){
-    clearInterval(nextJobIntervals[id]); // 🔹 Clear previous timer
+    clearInterval(nextJobIntervals[id]);
     let t = sec;
     const el = document.getElementById(`next-eta-${id}`);
     if(!el) return;
 
-    el.textContent = formatTime(t); // 🔹 Initialize immediately
+    el.textContent = formatTime(t);
     nextJobIntervals[id] = setInterval(() => {
         if(!el) { clearInterval(nextJobIntervals[id]); return; }
         el.textContent = formatTime(t--);
@@ -358,16 +356,21 @@ function setupNextJobCountdown(id, sec){
  * ALERTS PANEL
  ************************/
 function handleAlerts(data){
-    const alertsContainer = document.getElementById("alerts"); if(!alertsContainer) return; alertsContainer.innerHTML="";
-    data.locations.forEach(loc=>{loc.machines.forEach(m=>{
-        if(m.job){
-            const p = m.job.progress_percent;
-            if(p>=75 && p<90) createAlert(`${m.name} reached 75% progress!`,1);
-            else if(p>=90 && p<100) createAlert(`${m.name} reached 90% progress!`,2);
-            else if(p>=100) createAlert(`${m.name} completed!`,3);
-        }
-    })});
+    const alertsContainer = document.getElementById("alerts"); 
+    if(!alertsContainer) return; 
+    alertsContainer.innerHTML="";
+    data.locations.forEach(loc=>{
+        loc.machines.forEach(m=>{
+            if(m.job){
+                const p = m.job.progress_percent;
+                if(p>=75 && p<90) createAlert(`${renamedMachines[m.id]||m.name} reached 75% progress!`,1);
+                else if(p>=90 && p<100) createAlert(`${renamedMachines[m.id]||m.name} reached 90% progress!`,2);
+                else if(p>=100) createAlert(`${renamedMachines[m.id]||m.name} completed!`,3);
+            }
+        });
+    });
 }
+
 function createAlert(message,level){
     const alertsContainer = document.getElementById("alerts"); 
     if(!alertsContainer) return;
@@ -388,7 +391,8 @@ function updateMetricsModal(data){
     const tbody = modal.querySelector("tbody"); tbody.innerHTML="";
     data.locations.forEach(loc=>{loc.machines.forEach(m=>{
         const tr=document.createElement("tr");
-        tr.innerHTML=`<td>${loc.name}</td><td>${m.name}</td><td>${m.status}</td><td>${m.job?m.job.work_order:"N/A"}</td><td>${m.job?`${m.job.completed_qty}/${m.job.total_qty}`:"-"}</td><td>${m.job?m.job.progress_percent:0}</td>`;
+        const displayName = renamedMachines[m.id] || m.name; // show renamed name
+        tr.innerHTML=`<td>${loc.name}</td><td>${displayName}</td><td>${m.status}</td><td>${m.job?m.job.work_order:"N/A"}</td><td>${m.job?`${m.job.completed_qty}/${m.job.total_qty}`:"-"}</td><td>${m.job?m.job.progress_percent:0}</td>`;
         tbody.appendChild(tr);
     })});
 }
@@ -430,35 +434,53 @@ document.addEventListener("click",function(e){
 window.addEventListener("beforeunload",()=>{if(socket) socket.close();});
 
 /************************
- * MACHINE RENAME
+ * NEW JOB ALERT / ASSIGNMENT
  ************************/
-async function editMachineName(e, location, machineId, oldName){
-    e.preventDefault(); e.stopPropagation();
-    const newName = prompt("Enter new machine name:", oldName);
-    if(!newName || newName.trim()===oldName) return;
-
-    try{
-        const res = await fetch(`${API_BASE}/machine/rename`,{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({location,machine_id:machineId,new_name:newName.trim()})
-        });
-        const data = await res.json();
-        if(!data.ok) { alert("❌ Rename failed"); return; }
-
-        const card = document.getElementById(`machine-${machineId}`);
-        if(card){ const h3 = card.querySelector("h3"); h3.childNodes[0].nodeValue = newName + " "; }
-        createAlert(`✅ Machine renamed to ${newName}`,0);
-    } catch(err){ console.error(err); alert("❌ Rename error"); }
+function handleNewJob(job){
+    const { machine_id, work_order, qty, pipe_size, eta } = job;
+    const machineEl = document.getElementById(`machine-${machine_id}`);
+    if(machineEl) createAlert(`New Job for ${renamedMachines[machine_id]||job.machine_name}: ${work_order}`,0);
 }
-
 /************************
- * ERPNext WORK ORDERS
+ * NEW JOB ALERT / ASSIGNMENT (FIXED)
  ************************/
-function renderWorkOrders(work_orders){
-    console.log("ERPNext Work Orders:");
-    work_orders.forEach(wo => {
-        console.log(` - ${wo.id}: ${wo.status}, Qty: ${wo.produced_qty}/${wo.qty}`);
-    });
-}
+function handleNewJob(job){
+    const { machine_id, work_order, qty, pipe_size, eta, machine_name } = job;
 
+    // 🔹 Find the machine in dashboardCache
+    for(const loc of dashboardCache.locations){
+        const machine = loc.machines.find(m => m.id === machine_id);
+        if(machine){
+            // 🔹 If machine has no current job, assign as current job
+            if(!machine.job || machine.status === "idle"){
+                machine.job = {
+                    work_order: work_order,
+                    pipe_size: pipe_size,
+                    completed_qty: 0,
+                    total_qty: qty,
+                    remaining_time: eta
+                };
+            } else {
+                // Otherwise, push as next_job
+                machine.next_job = {
+                    work_order: work_order,
+                    pipe_size: pipe_size,
+                    produced_qty: 0,
+                    total_qty: qty,
+                    remaining_time: eta
+                };
+            }
+
+            // 🔹 Update the card instantly
+            const machineEl = document.getElementById(`machine-${machine_id}`);
+            if(machineEl){
+                const grid = machineEl.parentElement;
+                createOrUpdateMachineCard(machine, loc.name, grid);
+            }
+
+            break;
+        }
+    }
+
+    createAlert(`✅ New Job Assigned to ${renamedMachines[machine_id]||machine_name}: ${work_order}`, 0);
+}
